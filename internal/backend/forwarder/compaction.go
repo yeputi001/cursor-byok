@@ -79,6 +79,12 @@ func (service *Service) maybeCompactBeforeProvider(stream *ActiveStream, convers
 	}
 	manualInstruction, manual := parseManualCompactionDirective(stream.LatestUserText)
 	if !manual && autoCompactionCircuitOpen(conversation) {
+		if service != nil && service.debug != nil {
+			service.debug.LogProvider(context.Background(), stream.RequestID, stream.ConversationID, "auto_compact_skipped", map[string]any{
+				"reason":              "circuit_open",
+				"consecutive_failures": conversation.AutoCompactionConsecutiveFailures,
+			})
+		}
 		return false, nil
 	}
 	plan, err := service.buildCompactionPlan(stream, conversation, compiled, manual, manualInstruction)
@@ -90,6 +96,17 @@ func (service *Service) maybeCompactBeforeProvider(stream *ActiveStream, convers
 			return true, service.finishManualCompactionNoop(stream)
 		}
 		return false, nil
+	}
+	if service != nil && service.debug != nil {
+		service.debug.LogProvider(context.Background(), stream.RequestID, stream.ConversationID, "auto_compact_starting", map[string]any{
+			"trigger":              plan.Trigger,
+			"context_tokens":       plan.ContextTokens,
+			"context_window":       plan.ContextWindowSize,
+			"messages_to_compact":  plan.MessagesToCompact,
+			"compact_turn_count":   plan.CompactTurnCount,
+			"request_source":       plan.RequestSource,
+			"is_first_compaction":  plan.IsFirstCompaction,
+		})
 	}
 	return true, service.beginPendingCompaction(stream, plan)
 }
@@ -149,7 +166,7 @@ func (service *Service) buildAutoCompactionPlan(stream *ActiveStream, conversati
 	if contextWindowSize <= 0 {
 		return nil, nil
 	}
-	estimatedCompiledTokens := estimateCompiledPromptTokens(compiled)
+	estimatedCompiledTokens := resolveGatedPromptTokens(compiled, conversation)
 	reserveTokens := service.resolveCompactionReserveTokens(stream.ModelID)
 	if reserveTokens <= 0 {
 		reserveTokens = conversation.AutoCompactionReserveTokens
@@ -157,7 +174,7 @@ func (service *Service) buildAutoCompactionPlan(stream *ActiveStream, conversati
 	if reserveTokens <= 0 {
 		reserveTokens = compactionAutoReserveTokens
 	}
-	budgetTokens := contextWindowSize - reserveTokens
+	budgetTokens := providerInputBudgetTokens(conversation)
 	effectiveWindow := effectiveCompiledContextWindow(conversation)
 	preflightExceeded := estimatedCompiledTokens > 0 && estimatedCompiledTokens > budgetTokens
 	contextTokens := maxPositiveInt64(
@@ -165,9 +182,24 @@ func (service *Service) buildAutoCompactionPlan(stream *ActiveStream, conversati
 		estimatedCompiledTokens,
 		int64(conversation.TokenDetailsUsedTokens),
 	)
-	pendingExceeded := conversation.AutoCompactionPending && contextTokens > 0 && contextTokens > budgetTokens
-	thresholdExceeded := shouldAutoCompactByEstimate(estimatedCompiledTokens, effectiveWindow, 0)
+	compactThreshold := autoCompactTriggerThreshold(effectiveWindow)
+	pendingExceeded := conversation.AutoCompactionPending && contextTokens > 0 && contextTokens >= compactThreshold
+	thresholdExceeded := contextTokens >= compactThreshold ||
+		shouldAutoCompactByEstimate(estimatedCompiledTokens, effectiveWindow, 0) ||
+		shouldAutoCompactByOutputPressure(contextTokens, effectiveWindow)
 	if !pendingExceeded && !preflightExceeded && !thresholdExceeded {
+		if service != nil && service.debug != nil {
+			service.debug.LogProvider(context.Background(), stream.RequestID, stream.ConversationID, "auto_compact_skipped", map[string]any{
+				"reason":                 "below_threshold",
+				"context_tokens":         contextTokens,
+				"estimated_gated":        estimatedCompiledTokens,
+				"compact_threshold":      compactThreshold,
+				"effective_window":       effectiveWindow,
+				"budget_tokens":          budgetTokens,
+				"auto_compaction_pending": conversation.AutoCompactionPending,
+				"token_details_used":     conversation.TokenDetailsUsedTokens,
+			})
+		}
 		return nil, nil
 	}
 	usagePercent := 0.0
@@ -192,7 +224,10 @@ func (service *Service) buildAutoCompactionPlan(stream *ActiveStream, conversati
 	if err != nil {
 		return nil, err
 	}
-	if plan == nil && preflightExceeded {
+	if plan == nil && thresholdExceeded {
+		plan = service.buildForcedCompactionPlan(base, conversation)
+	}
+	if plan == nil && (preflightExceeded || thresholdExceeded) {
 		return nil, compactionTerminalError{
 			code: compactionOverflowTerminalCode,
 			message: fmt.Sprintf(
@@ -207,7 +242,7 @@ func (service *Service) buildAutoCompactionPlan(stream *ActiveStream, conversati
 }
 
 func (service *Service) resolveCompactionBaselineTokens(conversationID string, compiled CompiledConversation, conversation *ConversationFile) (int64, error) {
-	contextTokens := estimateCompiledPromptTokens(compiled)
+	contextTokens := resolveGatedPromptTokens(compiled, conversation)
 	if contextTokens > 0 {
 		return contextTokens, nil
 	}
@@ -283,6 +318,109 @@ func (service *Service) buildAutoCompactionPlanFromHistory(base *compactionPlan,
 	legacyPlan.CompactTurnCount++
 	legacyPlan.CompactedTurns = append(legacyPlan.CompactedTurns, currentCandidate.Summary)
 	return legacyPlan, nil
+}
+
+func (service *Service) buildForcedCompactionPlan(base *compactionPlan, conversation *ConversationFile) *compactionPlan {
+	if conversation == nil || base == nil {
+		return nil
+	}
+	entries := checkpointProjectionEntries(conversation.Entries)
+	if len(entries) == 0 {
+		return nil
+	}
+	if candidate, ok := buildRelaxedCurrentTurnCompactionCandidate(entries, base.CurrentTurnSeq, base.CurrentRequestID); ok {
+		plan := cloneCompactionPlanBase(base)
+		plan.RequestSource = compactionRequestSourceCurrentTurn
+		plan.MessagesToCompact = candidate.ReplayCount
+		plan.CompactTurnCount = 1
+		plan.CompactedTurns = []compactedTurnSummary{candidate.Summary}
+		if service != nil && service.debug != nil {
+			service.debug.LogProvider(context.Background(), base.CurrentRequestID, conversation.ConversationID, "auto_compact_forced_plan", map[string]any{
+				"source":              "relaxed_current_turn",
+				"messages_to_compact": plan.MessagesToCompact,
+				"estimated_tokens":    candidate.EstimatedTokens,
+			})
+		}
+		return &plan
+	}
+	return nil
+}
+
+func buildRelaxedCurrentTurnCompactionCandidate(entries []HistoryEntry, turnSeq int64, requestID string) (compactionCandidateTurn, bool) {
+	if len(entries) == 0 || turnSeq <= 0 {
+		return compactionCandidateTurn{}, false
+	}
+	normalizedRequestID := strings.TrimSpace(requestID)
+	turnIndexes := make([]int, 0)
+	for index, entry := range entries {
+		if entry.TurnSeq != turnSeq || strings.TrimSpace(entry.RequestID) != normalizedRequestID {
+			continue
+		}
+		if isCompactionSummaryKind(entry.Kind) {
+			continue
+		}
+		turnIndexes = append(turnIndexes, index)
+	}
+	tailReserve := contextMaxInLoopTailMessages + 2
+	if len(turnIndexes) <= tailReserve {
+		return compactionCandidateTurn{}, false
+	}
+	preserved := make(map[int]struct{})
+	for _, index := range turnIndexes[len(turnIndexes)-contextMaxInLoopTailMessages:] {
+		preserved[index] = struct{}{}
+	}
+	for _, index := range turnIndexes {
+		switch strings.TrimSpace(entries[index].Kind) {
+		case "user_message", "request_context":
+			preserved[index] = struct{}{}
+		}
+	}
+	summary := compactedTurnSummary{}
+	replayCount := int32(0)
+	estimatedTokens := int64(0)
+	for _, index := range turnIndexes {
+		if _, ok := preserved[index]; ok {
+			continue
+		}
+		entry := entries[index]
+		switch strings.TrimSpace(entry.Kind) {
+		case "user_message":
+			if strings.TrimSpace(summary.UserText) == "" {
+				summary.UserText = currentTurnUserText(entry)
+			}
+			replayCount++
+			estimatedTokens += estimateTextTokens(string(entry.Payload))
+		case "assistant_text":
+			if step := summarizeCurrentTurnAssistantEntry(entry); step != "" {
+				summary.Steps = append(summary.Steps, step)
+			}
+			replayCount++
+			estimatedTokens += estimateTextTokens(string(entry.Payload))
+		case "tool_call":
+			if step := summarizeCurrentTurnToolCallEntry(entry); step != "" {
+				summary.Steps = append(summary.Steps, step)
+			}
+			replayCount++
+			estimatedTokens += estimateTextTokens(string(entry.Payload))
+		case "tool_result":
+			if step := summarizeCurrentTurnToolResultEntry(entry); step != "" {
+				summary.Steps = append(summary.Steps, step)
+			}
+			replayCount++
+			estimatedTokens += estimateTextTokens(string(entry.Payload))
+		}
+	}
+	if replayCount <= 0 {
+		return compactionCandidateTurn{}, false
+	}
+	if len(summary.Steps) == 0 {
+		summary.Steps = append(summary.Steps, "forced_compaction=earlier current-turn history compacted")
+	}
+	return compactionCandidateTurn{
+		Summary:         summary,
+		ReplayCount:     replayCount,
+		EstimatedTokens: estimatedTokens,
+	}, true
 }
 
 func (service *Service) beginPendingCompaction(stream *ActiveStream, plan *compactionPlan) error {
@@ -601,7 +739,7 @@ func (service *Service) applyCompactionPlan(stream *ActiveStream, conversationID
 	if err != nil {
 		return err
 	}
-	if validationErr := validateCompactionCandidateBudget(recompiled, plan); validationErr != nil {
+	if validationErr := validateCompactionCandidateBudget(recompiled, candidateConversation, plan); validationErr != nil {
 		return validationErr
 	}
 	replacementEntries := append([]HistoryEntry(nil), candidateConversation.Entries...)
@@ -856,12 +994,12 @@ func buildFallbackCompactionSummary(plan *PendingCompaction) string {
 	return strings.TrimSpace(truncateCompactionText(strings.Join(sections, "\n\n"), compactionSummaryMaxChars))
 }
 
-func validateCompactionCandidateBudget(compiled CompiledConversation, plan *PendingCompaction) error {
+func validateCompactionCandidateBudget(compiled CompiledConversation, conversation *ConversationFile, plan *PendingCompaction) error {
 	if plan == nil {
 		return nil
 	}
 	budgetTokens := plan.ContextWindowSize - plan.ReserveTokens
-	estimatedTokens := estimateCompiledPromptTokens(compiled)
+	estimatedTokens := resolveGatedPromptTokens(compiled, conversation)
 	if budgetTokens > 0 && estimatedTokens <= budgetTokens {
 		return nil
 	}

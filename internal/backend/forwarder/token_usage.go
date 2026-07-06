@@ -288,11 +288,12 @@ func updateConversationAutoCompactionState(conversation *ConversationFile, promp
 	if reserveTokens <= 0 {
 		reserveTokens = compactionAutoReserveTokens
 	}
-	threshold := effectiveWindow - int64(contextAutoCompactBufferTokens)
-	if threshold < effectiveWindow/2 {
-		threshold = effectiveWindow / 2
+	compactThreshold := autoCompactTriggerThreshold(effectiveWindow)
+	if compactThreshold <= 0 {
+		clearConversationAutoCompactionState(conversation)
+		return
 	}
-	if threshold <= 0 || promptTokensTotal < threshold {
+	if promptTokensTotal < compactThreshold {
 		clearConversationAutoCompactionState(conversation)
 		return
 	}

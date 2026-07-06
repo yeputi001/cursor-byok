@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"encoding/json"
 	"strings"
 
 	modeladapter "cursor/internal/backend/agent/model"
@@ -12,14 +13,22 @@ const (
 	contextAutoCompactBufferTokens   = 13_000
 	contextSummaryReserveTokens      = 20_000
 	contextMaxConsecutiveCompactFail = 3
-	contextMaxPTLRetries               = 3
+	contextMaxPTLRetries             = 3
 	contextMaxTooLongRetries           = 2
 
-	contextMaxToolMessageBytes       = 24 * 1024
-	contextMaxWorkspaceContextBytes  = 48 * 1024
-	contextTrimMessageThreshold      = 35
-	contextEarlyTrimFraction         = 0.50
-	contextMaxInLoopTailMessages     = 28
+	contextMaxToolMessageBytes      = 24 * 1024
+	contextMaxWorkspaceContextBytes = 48 * 1024
+	contextMaxCompiledMessageBytes  = 32 * 1024
+	contextMaxToolsTotalBytes       = 96 * 1024
+	contextTrimMessageThreshold     = 35
+	contextEarlyTrimFraction        = 0.50
+	contextAutoCompactUsageFraction = 0.75
+	contextMinOutputReserveTokens   = 16_000
+	contextMaxInLoopTailMessages    = 28
+
+	// Estimates use rune/4; real Claude tokenizers often count code/JSON higher.
+	contextEstimateSafetyNumerator   = 7
+	contextEstimateSafetyDenominator = 5
 )
 
 // effectiveCompiledContextWindow returns the token budget available to the
@@ -31,6 +40,46 @@ func effectiveCompiledContextWindow(conversation *ConversationFile) int64 {
 		return total / 2
 	}
 	return total - reserved
+}
+
+// resolveGatedPromptTokens returns the token count used for trim/compact
+// decisions. It prefers the higher of: safety-adjusted estimate, last known
+// provider usage, and pending auto-compaction telemetry.
+func resolveGatedPromptTokens(compiled CompiledConversation, conversation *ConversationFile) int64 {
+	estimated := applyContextEstimateSafety(estimateCompiledPromptTokens(compiled))
+	if conversation == nil {
+		return estimated
+	}
+	gated := maxPositiveInt64(
+		estimated,
+		int64(conversation.TokenDetailsUsedTokens),
+		conversation.AutoCompactionPromptTokens,
+	)
+	if prefix := conversation.LatestRequestPrefix; prefix != nil {
+		if strings.TrimSpace(conversation.CurrentRequestID) != "" &&
+			strings.TrimSpace(prefix.RequestID) == strings.TrimSpace(conversation.CurrentRequestID) &&
+			prefix.PromptTokensTotal > gated {
+			gated = prefix.PromptTokensTotal
+		}
+	}
+	return gated
+}
+
+func applyContextEstimateSafety(tokens int64) int64 {
+	if tokens <= 0 {
+		return 0
+	}
+	return tokens * int64(contextEstimateSafetyNumerator) / int64(contextEstimateSafetyDenominator)
+}
+
+// providerInputBudgetTokens is the hard input ceiling before a provider call.
+func providerInputBudgetTokens(conversation *ConversationFile) int64 {
+	effective := effectiveCompiledContextWindow(conversation)
+	budget := effective - int64(contextAutoCompactBufferTokens)
+	if budget < 8_000 {
+		budget = 8_000
+	}
+	return budget
 }
 
 // trimBudgetTarget is the proactive token count we trim toward before the
@@ -59,6 +108,26 @@ func shouldTrimCompiledContext(tokensUsed, effectiveWindow int64, messageCount i
 	return tokensUsed >= early || shouldAutoCompactByEstimate(tokensUsed, effectiveWindow, 0)
 }
 
+// autoCompactTriggerThreshold is when auto-compact should fire. Uses the lower
+// of (effective - buffer) and 75% of effective so 143k on a 200k model triggers
+// compact around ~135k instead of waiting until ~167k.
+func autoCompactTriggerThreshold(effectiveWindow int64) int64 {
+	if effectiveWindow <= 0 {
+		return 0
+	}
+	byBuffer := effectiveWindow - int64(contextAutoCompactBufferTokens)
+	byFraction := int64(float64(effectiveWindow) * contextAutoCompactUsageFraction)
+	threshold := byBuffer
+	if byFraction < threshold {
+		threshold = byFraction
+	}
+	floor := effectiveWindow / 2
+	if threshold < floor {
+		threshold = floor
+	}
+	return threshold
+}
+
 // shouldAutoCompactByEstimate returns true when estimated usage crosses the
 // buffer threshold inside the effective window. snipFreed adjusts the estimate
 // when a cheap head-snip already dropped tokens this round.
@@ -66,11 +135,16 @@ func shouldAutoCompactByEstimate(tokensUsed, effectiveWindow, snipFreed int64) b
 	if effectiveWindow <= 0 {
 		return false
 	}
-	threshold := effectiveWindow - int64(contextAutoCompactBufferTokens)
-	if threshold < 0 {
-		threshold = effectiveWindow / 2
+	return tokensUsed-snipFreed >= autoCompactTriggerThreshold(effectiveWindow)
+}
+
+// shouldAutoCompactByOutputPressure triggers when remaining headroom cannot
+// sustain a useful model response (explains output=8 with oversized input).
+func shouldAutoCompactByOutputPressure(gated, effectiveWindow int64) bool {
+	if effectiveWindow <= 0 || gated <= 0 {
+		return false
 	}
-	return tokensUsed-snipFreed >= threshold
+	return effectiveWindow-gated < int64(contextMinOutputReserveTokens)
 }
 
 // isContextTooLong reports upstream rejections that mean the prompt must shrink.
@@ -120,58 +194,117 @@ func manageCompiledContextBeforeProvider(compiled CompiledConversation, conversa
 	if len(compiled.Messages) < 2 {
 		return compiled, result
 	}
-	effective := effectiveCompiledContextWindow(conversation)
-	tokensUsed := estimateCompiledPromptTokens(compiled)
-	targetTokens := trimBudgetTarget(effective)
+	beforeGated := resolveGatedPromptTokens(compiled, conversation)
+	budget := providerInputBudgetTokens(conversation)
+	targetTokens := trimBudgetTarget(effectiveCompiledContextWindow(conversation))
 	if aggressive {
-		targetTokens = effective / 3
+		targetTokens = budget / 2
 		if targetTokens < 4_000 {
 			targetTokens = 4_000
 		}
 	}
-	prefixLen := compiledPromptPrefixLen(compiled)
-	if !shouldTrimCompiledContext(tokensUsed, effective, len(compiled.Messages)) && !aggressive {
+	effective := effectiveCompiledContextWindow(conversation)
+	needsTrim := aggressive ||
+		beforeGated > budget ||
+		shouldTrimCompiledContext(beforeGated, effective, len(compiled.Messages))
+	if !needsTrim {
 		return compiled, result
 	}
-	trimmed := emergencyTrimCompiledMessages(compiled.Messages, prefixLen, targetTokens)
-	after := estimateModelMessagesTokens(trimmed)
-	if after < tokensUsed {
-		result.Trimmed = true
-		result.TokensFreed = tokensUsed - after
-		compiled.Messages = trimmed
-		tokensUsed = after
+	if targetTokens > budget {
+		targetTokens = budget
 	}
-	if shouldAutoCompactByEstimate(tokensUsed, effective, 0) {
-		compactTarget := effective - int64(contextAutoCompactBufferTokens)
-		if compactTarget < effective/2 {
-			compactTarget = effective / 2
-		}
-		snipped, freed := cheapSnipOldCompiledMessages(compiled.Messages, prefixLen, compactTarget)
-		if freed > 0 {
-			compiled.Messages = snipped
-			result.SnipFreed += freed
+	compiled, freed := shrinkCompiledConversation(compiled, targetTokens)
+	if freed > 0 {
+		result.Trimmed = true
+		result.TokensFreed = freed
+	}
+	afterGated := resolveGatedPromptTokens(compiled, conversation)
+	if afterGated > budget {
+		var extraFreed int64
+		compiled, extraFreed = shrinkCompiledConversation(compiled, budget/2)
+		if extraFreed > 0 {
 			result.Trimmed = true
+			result.TokensFreed += extraFreed
 		}
 	}
 	return compiled, result
 }
 
-func compiledPromptPrefixLen(compiled CompiledConversation) int {
+// enforceProviderInputBudget keeps trimming until gated usage fits the hard
+// provider input ceiling or no further progress is possible.
+func enforceProviderInputBudget(compiled CompiledConversation, conversation *ConversationFile) CompiledConversation {
+	budget := providerInputBudgetTokens(conversation)
+	for pass := 0; pass < 5; pass++ {
+		gated := resolveGatedPromptTokens(compiled, conversation)
+		if gated <= budget {
+			return compiled
+		}
+		target := budget
+		if pass > 0 {
+			target = budget / int64(pass+1)
+			if target < 4_000 {
+				target = 4_000
+			}
+		}
+		before := estimateCompiledPromptTokens(compiled)
+		next, _ := shrinkCompiledConversation(compiled, target)
+		after := estimateCompiledPromptTokens(next)
+		if after >= before {
+			break
+		}
+		compiled = next
+	}
+	return compiled
+}
+
+func shrinkCompiledConversation(compiled CompiledConversation, targetTokens int64) (CompiledConversation, int64) {
+	if len(compiled.Messages) < 2 || targetTokens <= 0 {
+		return compiled, 0
+	}
+	before := estimateCompiledPromptTokens(compiled)
+	compiled.Tools = capCompiledToolDescriptors(compiled.Tools)
+	messages := capCompiledMessageBodies(compiled.Messages)
+	messages = truncateAllCompiledToolMessages(messages)
+	messages = capCompiledWorkspaceMessages(messages)
+
+	prefixLen := compiledPromptPrefixLen(compiled, messages)
+	messages = emergencyTrimCompiledMessages(messages, prefixLen, targetTokens)
+	compiled.Messages = messages
+
+	after := estimateCompiledPromptTokens(compiled)
+	freed := before - after
+	if freed < 0 {
+		freed = 0
+	}
+	return compiled, freed
+}
+
+func compiledPromptPrefixLen(compiled CompiledConversation, messages []modeladapter.Message) int {
 	stable := compiled.StableMessageCount
 	if stable < 0 {
 		stable = 0
 	}
-	return 1 + stable
+	prefix := 1 + stable
+	if prefix > len(messages) {
+		prefix = len(messages)
+	}
+	if prefix < 1 {
+		prefix = 1
+	}
+	return prefix
 }
 
 // cheapSnipOldCompiledMessages drops the oldest replayed history messages
 // (after the static system prefix) until estimated tokens fall below target
 // or no more history remains. Returns tokens freed (estimate).
 func cheapSnipOldCompiledMessages(messages []modeladapter.Message, prefixLen int, targetTokens int64) ([]modeladapter.Message, int64) {
-	if len(messages) < 2 || prefixLen < 2 {
+	if len(messages) < 2 {
 		return messages, 0
 	}
 	before := estimateModelMessagesTokens(messages)
+	if prefixLen < 2 {
+		return trimCompiledInLoopTail(messages, 1, contextMaxInLoopTailMessages), before - estimateModelMessagesTokens(messages)
+	}
 	histStart := 1
 	if histStart >= len(messages) {
 		return messages, 0
@@ -181,7 +314,7 @@ func cheapSnipOldCompiledMessages(messages []modeladapter.Message, prefixLen int
 		histEnd = len(messages)
 	}
 	if histEnd <= histStart {
-		return messages, 0
+		return trimCompiledInLoopTail(messages, 1, contextMaxInLoopTailMessages), before - estimateModelMessagesTokens(messages)
 	}
 	out := append([]modeladapter.Message(nil), messages[:histStart]...)
 	hist := append([]modeladapter.Message(nil), messages[histStart:histEnd]...)
@@ -211,22 +344,79 @@ func emergencyTrimCompiledMessages(messages []modeladapter.Message, prefixLen in
 	if len(messages) < 2 || targetTokens <= 0 {
 		return messages
 	}
-	out := truncateAllCompiledToolMessages(messages)
-	out = capCompiledWorkspaceMessages(out)
-
+	out := messages
 	if estimateModelMessagesTokens(out) <= targetTokens {
 		return out
 	}
 	snipped, _ := cheapSnipOldCompiledMessages(out, prefixLen, targetTokens)
 	out = snipped
 
-	for keep := contextMaxInLoopTailMessages; keep >= 4 && estimateModelMessagesTokens(out) > targetTokens; keep -= 4 {
-		out = trimCompiledInLoopTail(out, prefixLen, keep)
+	for keep := contextMaxInLoopTailMessages; keep >= 2 && estimateModelMessagesTokens(out) > targetTokens; keep -= 4 {
+		out = trimCompiledInLoopTail(out, maxInt(1, prefixLen), keep)
 	}
-	if estimateModelMessagesTokens(out) > targetTokens {
-		out = trimCompiledInLoopTail(out, prefixLen, 2)
+	for estimateModelMessagesTokens(out) > targetTokens && len(out) > 2 {
+		out = trimCompiledInLoopTail(out, 1, 2)
 	}
 	return out
+}
+
+func capCompiledMessageBodies(messages []modeladapter.Message) []modeladapter.Message {
+	out := make([]modeladapter.Message, len(messages))
+	for i, message := range messages {
+		out[i] = message
+		if strings.TrimSpace(message.Role) == "system" {
+			continue
+		}
+		if text := strings.TrimSpace(message.Content); text != "" && len(text) > contextMaxCompiledMessageBytes {
+			out[i].Content = truncateCompiledText(text, contextMaxCompiledMessageBytes, "message body")
+		}
+		if len(message.ToolCalls) == 0 {
+			continue
+		}
+		toolCalls := make([]modeladapter.ToolCallDescriptor, len(message.ToolCalls))
+		for j, toolCall := range message.ToolCalls {
+			toolCalls[j] = toolCall
+			if len(toolCall.Function.Arguments) > contextMaxCompiledMessageBytes {
+				toolCalls[j].Function.Arguments = truncateCompiledText(
+					toolCall.Function.Arguments,
+					contextMaxCompiledMessageBytes,
+					"tool arguments",
+				)
+			}
+		}
+		out[i].ToolCalls = toolCalls
+	}
+	return out
+}
+
+func capCompiledToolDescriptors(tools []json.RawMessage) []json.RawMessage {
+	if len(tools) == 0 {
+		return tools
+	}
+	total := 0
+	out := make([]json.RawMessage, 0, len(tools))
+	for _, tool := range tools {
+		text := string(tool)
+		if total+len(text) > contextMaxToolsTotalBytes {
+			break
+		}
+		out = append(out, tool)
+		total += len(text)
+	}
+	return out
+}
+
+func truncateCompiledText(text string, maxBytes int, label string) string {
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return text
+	}
+	marker := "\n…[" + strings.TrimSpace(label) + " truncated to fit model limit]"
+	cut := maxBytes - len(marker)
+	if cut < 256 {
+		cut = maxBytes
+		marker = ""
+	}
+	return text[:cut] + marker
 }
 
 func truncateCompiledToolPayload(msg modeladapter.Message, maxBytes int) modeladapter.Message {
@@ -237,14 +427,8 @@ func truncateCompiledToolPayload(msg modeladapter.Message, maxBytes int) modelad
 	if len(text) <= maxBytes {
 		return msg
 	}
-	marker := "\n…[tool output truncated — call Read on the file or re-run with a narrower scope to see the rest]"
-	cut := maxBytes - len(marker)
-	if cut < 256 {
-		cut = maxBytes
-		marker = ""
-	}
 	out := msg
-	out.Content = text[:cut] + marker
+	out.Content = truncateCompiledText(text, maxBytes, "tool output")
 	return out
 }
 
@@ -266,19 +450,12 @@ func capCompiledWorkspaceMessages(messages []modeladapter.Message) []modeladapte
 			continue
 		}
 		text := strings.TrimSpace(out[i].Content)
-		if text == "" || !strings.Contains(text, "<user_info>") {
+		if text == "" {
 			continue
 		}
-		if len(text) <= contextMaxWorkspaceContextBytes {
-			continue
+		if strings.Contains(text, "<user_info>") && len(text) > contextMaxWorkspaceContextBytes {
+			out[i].Content = truncateCompiledText(text, contextMaxWorkspaceContextBytes, "workspace context")
 		}
-		marker := "\n…[workspace context truncated to fit model limit]"
-		cut := contextMaxWorkspaceContextBytes - len(marker)
-		if cut < 1024 {
-			cut = contextMaxWorkspaceContextBytes
-			marker = ""
-		}
-		out[i].Content = text[:cut] + marker
 	}
 	return out
 }
@@ -359,4 +536,11 @@ func contextUsagePercent(tokensUsed, effectiveWindow int64) float64 {
 		return 0
 	}
 	return pct
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
