@@ -46,6 +46,12 @@ jobs:
       - name: Install Task
         run: brew install go-task/tap/go-task
 
+      - name: Install Protocol Buffers tools
+        run: |
+          brew install protobuf
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install connectrpc.com/connect/cmd/protoc-gen-connect-go@latest
+
       - name: Install GitHub CLI
         run: brew install gh
 
