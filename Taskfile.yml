@@ -7,7 +7,7 @@ includes:
   linux: ./build/linux/Taskfile.yml
 
 vars:
-  APP_NAME: "Cursor??"
+  APP_NAME: "Cursor助手"
   BIN_DIR: "bin"
   APP_VERSION:
     sh: 'go run ./scripts/release version -config ./build/config.yml'
@@ -26,24 +26,24 @@ vars:
 
 tasks:
   build:
-    summary: ?????????
+    summary: 构建当前系统分发包
     preconditions:
       - sh: '[ "{{OS}}" = "darwin" ] || [ "{{OS}}" = "windows" ] || [ "{{OS}}" = "linux" ]'
-        msg: "???? macOS?Windows ? Linux ??? task build"
+        msg: "仅支持在 macOS、Windows 或 Linux 上执行 task build"
     cmds:
       - task: clean:dist
       - task: build:current
 
   run:
-    summary: ????????
+    summary: 运行当前系统版本
     cmds:
       - task: "{{OS}}:run"
 
   build:all:
-    summary: ???? macOS/Windows ????Linux ???? Linux ???????
+    summary: 构建全部 macOS/Windows 分发包（Linux 需在原生 Linux 主机单独构建）
     preconditions:
       - sh: '[ "{{OS}}" = "darwin" ]'
-        msg: "task build:all ???? macOS ????Linux ???? Linux ?????"
+        msg: "task build:all 仅支持在 macOS 上执行；Linux 需在原生 Linux 主机构建。"
     cmds:
       - task: clean:dist
       - task: build:darwin:arm64
@@ -145,7 +145,7 @@ tasks:
           SCAN: '{{.SCAN}}'
 
   cursor-tab-server:docker:amd64:
-    summary: ?? cursor-tab-server ? linux/amd64 Docker ?????? cursor-tab-server ??
+    summary: 构建 cursor-tab-server 的 linux/amd64 Docker 镜像并保存到 cursor-tab-server 目录
     vars:
       IMAGE_NAME: '{{.IMAGE_NAME | default "cursor-tab-server:linux-amd64"}}'
       IMAGE_TAR: '{{.IMAGE_TAR | default "cursor-tab-server/cursor-tab-server-linux-amd64.tar"}}'
@@ -153,11 +153,11 @@ tasks:
       DOCKERFILE: cursor-tab-server/Dockerfile
     preconditions:
       - sh: docker info >/dev/null 2>&1
-        msg: "??????? Docker daemon????? Docker?"
+        msg: "未检测到可用的 Docker daemon，请先启动 Docker。"
       - sh: test -f "{{.DOCKERFILE}}"
-        msg: "??? cursor-tab-server/Dockerfile?"
+        msg: "未找到 cursor-tab-server/Dockerfile。"
       - sh: test -f "{{.CONTEXT_DIR}}/go.mod"
-        msg: "??? cursor-tab-server/go.mod?"
+        msg: "未找到 cursor-tab-server/go.mod。"
     cmds:
       - mkdir -p "{{.CONTEXT_DIR}}"
       - docker build --platform linux/amd64 -t "{{.IMAGE_NAME}}" -f "{{.DOCKERFILE}}" "{{.CONTEXT_DIR}}"
@@ -174,17 +174,17 @@ tasks:
       - rm -rf "{{.BIN_DIR}}/macos-arm64.app" "{{.BIN_DIR}}/macos-intel.app" "{{.BIN_DIR}}/{{.APP_NAME}}.app" "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app"
 
   dev:
-    summary: ??????????????????
+    summary: 启动开发模式（前台，终端会保持占用）
     cmds:
       - wails3 dev -config ./build/config.yml -port {{.VITE_PORT}}
 
   setup:docker:
-    summary: ?? Linux ???? Docker ??
+    summary: 构建 Linux 交叉编译 Docker 镜像
     cmds:
       - task: common:setup:docker
 
   release:clean:
-    summary: ???????????
+    summary: 清理当前版本的发布目录
     cmds:
       - rm -rf "{{.RELEASE_DIR}}"
       - mkdir -p "{{.RELEASE_DIR}}"
@@ -195,13 +195,13 @@ tasks:
       - mkdir -p "{{.RELEASE_DIR}}"
 
   release:notes:
-    summary: ? release-notes.md ??????????????README.md ??????????
+    summary: 从 release-notes.md 生成当前版本的发布说明文件（README.md 仅用于公开仓库同步）
     internal: true
     preconditions:
       - sh: test -f "{{.RELEASE_SOURCE_PATH}}"
-        msg: "??? release-notes.md????????????"
+        msg: "未找到 release-notes.md，请先创建发布日志文件。"
       - sh: test -n "$(tr -d '[:space:]' < "{{.RELEASE_SOURCE_PATH}}")"
-        msg: "release-notes.md ??????????????"
+        msg: "release-notes.md 不能为空，请先填写发布日志。"
     cmds:
       - go run ./scripts/release notes -config ./build/config.yml -out "{{.RELEASE_NOTES_PATH}}" -source "{{.RELEASE_SOURCE_PATH}}"
 
@@ -249,28 +249,28 @@ tasks:
           SCAN: '{{.SCAN}}'
 
   release:manifest:
-    summary: ?? update.json
+    summary: 生成 update.json
     internal: true
     cmds:
       - go run ./scripts/release manifest -config ./build/config.yml -assets-dir "{{.RELEASE_DIR}}" -out "{{.RELEASE_DIR}}/update.json" -repo "{{.RELEASE_REPO}}" -base-name "{{.RELEASE_BASE_NAME}}" -notes "{{.RELEASE_NOTES_PATH}}"
 
   release:prepare:
-    summary: ???????????????
+    summary: 在当前主机上生成对应的发布资产
     preconditions:
       - sh: '[ "{{OS}}" = "darwin" ] || [ "{{OS}}" = "linux" ]'
-        msg: "release:prepare ???? macOS ? Linux ????"
+        msg: "release:prepare 仅支持在 macOS 或 Linux 上执行。"
       - sh: wails3 version >/dev/null 2>&1
-        msg: "???? wails3????? Wails v3 CLI?"
+        msg: "未检测到 wails3，请先安装 Wails v3 CLI。"
     cmds:
       - task: '{{if eq OS "darwin"}}release:prepare:darwin{{else}}release:prepare:linux{{end}}'
 
   release:prepare:darwin:
-    summary: ? macOS ??? macOS/Windows/Linux ????
+    summary: 在 macOS 上生成 macOS/Windows/Linux 发布资产
     preconditions:
       - sh: '[ "{{OS}}" = "darwin" ]'
-        msg: "release:prepare:darwin ???? macOS ????"
+        msg: "release:prepare:darwin 仅支持在 macOS 上执行。"
       - sh: wails3 version >/dev/null 2>&1
-        msg: "???? wails3????? Wails v3 CLI?"
+        msg: "未检测到 wails3，请先安装 Wails v3 CLI。"
     cmds:
       - task: release:clean
       - task: common:update:build-assets
@@ -281,12 +281,12 @@ tasks:
       - task: release:build:linux:amd64
 
   release:prepare:linux:
-    summary: ???????? Linux ????
+    summary: 在当前主机上生成 Linux 发布资产
     preconditions:
       - sh: '[ "{{OS}}" = "linux" ] || [ "{{OS}}" = "darwin" ]'
-        msg: "release:prepare:linux ?????? Linux ? macOS ????"
+        msg: "release:prepare:linux 当前仅支持在 Linux 或 macOS 上执行。"
       - sh: wails3 version >/dev/null 2>&1
-        msg: "???? wails3????? Wails v3 CLI?"
+        msg: "未检测到 wails3，请先安装 Wails v3 CLI。"
     cmds:
       - task: release:ensure:dir
       - task: common:update:build-assets
@@ -294,23 +294,23 @@ tasks:
       - task: release:build:linux:amd64
 
   release:verify:assets:
-    summary: ??????????????
+    summary: 验证当前版本发布资产是否齐全
     preconditions:
       - sh: test -f "{{.RELEASE_NOTES_PATH}}"
-        msg: "??????????????? release:prepare ???"
+        msg: "未找到发布说明，请先执行对应的 release:prepare 任务。"
       - sh: test -f "{{.RELEASE_DIR}}/{{.RELEASE_BASE_NAME}}-{{.APP_VERSION}}-macos-arm64.tar.gz"
-        msg: "?? macOS arm64 ?????"
+        msg: "缺少 macOS arm64 发布资产。"
       - sh: test -f "{{.RELEASE_DIR}}/{{.RELEASE_BASE_NAME}}-{{.APP_VERSION}}-macos-amd64.tar.gz"
-        msg: "?? macOS amd64 ?????"
+        msg: "缺少 macOS amd64 发布资产。"
       - sh: test -f "{{.RELEASE_DIR}}/{{.RELEASE_BASE_NAME}}-{{.APP_VERSION}}-windows-amd64.zip"
-        msg: "?? Windows amd64 ?????"
+        msg: "缺少 Windows amd64 发布资产。"
       - sh: test -f "{{.RELEASE_DIR}}/{{.RELEASE_BASE_NAME}}-{{.APP_VERSION}}-linux-amd64.tar.gz"
-        msg: "?? Linux amd64 ?????"
+        msg: "缺少 Linux amd64 发布资产。"
     cmds:
       - echo "release assets verified"
 
   release:sync:readme:
-    summary: ?? README ????????????????? release-notes.md?
+    summary: 同步 README 到公开发布仓库（发布日志来源固定为 release-notes.md）
     internal: true
     env:
       GH_PAGER: cat
@@ -318,9 +318,9 @@ tasks:
       PAGER: cat
     preconditions:
       - sh: gh --version >/dev/null 2>&1
-        msg: "???? gh????? GitHub CLI?"
+        msg: "未检测到 gh，请先安装 GitHub CLI。"
       - sh: gh auth token >/dev/null 2>&1
-        msg: "gh ???????? gh auth login?"
+        msg: "gh 未登录，请先执行 gh auth login。"
     cmds:
       - |
         python3 - <<'PY'
@@ -393,16 +393,16 @@ tasks:
         PY
 
   release:github:
-    summary: ??????? GitHub Releases
+    summary: 发布当前版本到 GitHub Releases
     env:
       GH_PAGER: cat
       GIT_PAGER: cat
       PAGER: cat
     preconditions:
       - sh: gh --version >/dev/null 2>&1
-        msg: "???? gh????? GitHub CLI?"
+        msg: "未检测到 gh，请先安装 GitHub CLI。"
       - sh: gh auth token >/dev/null 2>&1
-        msg: "gh ???????? gh auth login?"
+        msg: "gh 未登录，请先执行 gh auth login。"
     cmds:
       - task: release:verify:assets
       - task: release:manifest
